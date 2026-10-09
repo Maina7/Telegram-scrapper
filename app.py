@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
-# Folder that contains this script; everything is resolved relative to it,
-# so the script behaves the same no matter which directory it is run from.
 BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
