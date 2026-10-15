@@ -1,8 +1,9 @@
 import os
 import re
+import csv
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,8 +17,7 @@ WEBSITE = os.getenv("WEBSITE")
 if not WEBSITE:
     raise SystemExit("WEBSITE must be set in .env")
 
-OUT_DIR = BASE_DIR / "kenyan_towns"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_FILE = BASE_DIR / "nairobi_cities.csv"
 
 HEADERS = {
     "User-Agent": (
@@ -26,86 +26,73 @@ HEADERS = {
     )
 }
 
-# WordPress thumbnails are named "<name>-600x600.jpg"; the original is "<name>.jpg"
-THUMB_SUFFIX = re.compile(r"-\d+x\d+(?=\.\w+$)")
+# Delay between page requests, to be polite to the server
+DELAY = 2
 
 
-def safe_name(text):
-    """Turn a town name into a filename-safe string."""
-    return re.sub(r"[^\w\- ]", "", text).strip().replace(" ", "_")
-
-
-def find_images(html):
-    """Return a list of (name, image_url) for every town card on the page."""
+def parse_page(html, page_url):
+    """Return (cities, page_urls, expected_total) for one listing page."""
     soup = BeautifulSoup(html, "html.parser")
-    found = []
-    seen = set()
 
-    for card in soup.select("div.cards div.card"):
-        img = card.find("img")
-        if not img or not img.get("src"):
-            continue
+    cities = []
+    for a in soup.select(".card-body a.link[href$='_city']"):
+        name = " ".join(a.get_text().split())
+        if name:
+            cities.append((name, urljoin(page_url, a["href"])))
 
-        url = urljoin(WEBSITE, img["src"])
-        if url in seen:
-            continue
-        seen.add(url)
+    # Links to every page (1, 2, 3, ...) from the pagination bar
+    page_urls = [urljoin(page_url, a["href"]) for a in soup.select("ul.pagination a.page-link[href]")]
 
-        title = card.find(["h4", "h3", "h2"])
-        name = safe_name(title.get_text()) if title else ""
-        if not name:
-            name = safe_name(Path(urlparse(url).path).stem)
-        found.append((name, url))
+    # "276 found in this state." -> 276
+    total = None
+    match = re.search(r"(\d+)\s+found in this state", soup.get_text())
+    if match:
+        total = int(match.group(1))
 
-    return found
-
-
-def download(session, name, url):
-    """Download one image, preferring the full-size original over the thumbnail."""
-    ext = Path(urlparse(url).path).suffix.lower() or ".jpg"
-    path = OUT_DIR / f"{name}{ext}"
-    if path.exists():
-        return path, False
-
-    original = THUMB_SUFFIX.sub("", url)
-    for candidate in dict.fromkeys([original, url]):
-        r = session.get(candidate, timeout=30)
-        if r.ok and r.headers.get("Content-Type", "").startswith("image/"):
-            path.write_bytes(r.content)
-            return path, True
-
-    raise RuntimeError(f"HTTP {r.status_code}")
+    return cities, page_urls, total
 
 
 def main():
     with requests.Session() as session:
         session.headers.update(HEADERS)
 
-        page = session.get(WEBSITE, timeout=30)
-        page.raise_for_status()
+        to_visit = [WEBSITE]
+        visited = set()
+        cities = {}
+        expected = None
 
-        images = find_images(page.text)
-        if not images:
-            raise SystemExit("No images found - the page layout may have changed.")
-        print(f"Found {len(images)} images, saving into {OUT_DIR}")
-
-        saved = skipped = failed = 0
-        for name, url in images:
-            try:
-                path, is_new = download(session, name, url)
-            except Exception as e:
-                failed += 1
-                print(f"Failed {name}: {e}")
+        while to_visit:
+            url = to_visit.pop(0)
+            if url in visited:
                 continue
+            visited.add(url)
 
-            if is_new:
-                saved += 1
-                print(f"Saved {path.name}")
-                time.sleep(0.5)  # be polite to the server
-            else:
-                skipped += 1
+            if len(visited) > 1:
+                time.sleep(DELAY)
 
-        print(f"Done. Saved {saved}, skipped {skipped} already downloaded, failed {failed}.")
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+
+            page_cities, page_urls, total = parse_page(r.text, r.url)
+            expected = expected or total
+            for name, link in page_cities:
+                cities.setdefault(link, name)
+            print(f"{url}: {len(page_cities)} cities")
+
+            to_visit.extend(u for u in page_urls if u not in visited)
+
+    if not cities:
+        raise SystemExit("No cities found - the page layout may have changed.")
+
+    with OUT_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["city", "url"])
+        for link, name in sorted(cities.items(), key=lambda item: item[1].lower()):
+            writer.writerow([name, link])
+
+    print(f"Done. Saved {len(cities)} cities from {len(visited)} pages to {OUT_FILE}")
+    if expected and expected != len(cities):
+        print(f"Warning: the site says {expected} cities, but {len(cities)} were scraped.")
 
 
 if __name__ == "__main__":
